@@ -1,206 +1,208 @@
 # ================================================
-# Mini Real Project: Prompt Injection Classifier
+# Prompt Injection Classifier (clean version)
+# - Model: protectai/deberta-v3-base-prompt-injection
+# - Easy:  xTRam1/safe-guard-prompt-injection
+# - Hard:  reshabhs/SPML_Chatbot_Prompt_Injection
 # ================================================
 
-# Model: protectai/deberta-v3-base-prompt-injection
-# Dataset 1 (easy): xTRam1/safe-guard-prompt-injection
-# Dataset 2 (hard): reshabhs/SPML_Chatbot_Prompt_Injection
+import os, random
+from datetime import datetime
 
-from datasets import load_dataset
+import numpy as np
+import torch
+from datasets import load_dataset, concatenate_datasets
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, ConfusionMatrixDisplay, classification_report
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     Trainer,
     TrainingArguments
 )
-import numpy as np
-from sklearn.metrics import accuracy_score, f1_score
+import matplotlib.pyplot as plt
 
-# -----------------------------------------------
-# 1️⃣ Load pretrained model + tokenizer
-# -----------------------------------------------
-model_name = "protectai/deberta-v3-base-prompt-injection"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForSequenceClassification.from_pretrained(model_name)
-import torch
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-model.to(device)
+# --------- quality-of-life ----------
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
-# -----------------------------------------------
-# 2️⃣ Load the first dataset (easy)
-# -----------------------------------------------
-dataset_name = "xTRam1/safe-guard-prompt-injection"
-dataset = load_dataset(dataset_name)
+# --------- device ----------
+device = torch.device("mps" if torch.backends.mps.is_available() else
+                      ("cuda" if torch.cuda.is_available() else "cpu"))
 
-# check column names to confirm what the text/label columns are called
-print(dataset)
+# --------- model/tokenizer ----------
+MODEL_NAME = "protectai/deberta-v3-base-prompt-injection"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME).to(device)
 
-# -----------------------------------------------
-# 3️⃣ Tokenize data
-# -----------------------------------------------
-def preprocess(example):
-    return tokenizer(
-        example["text"],  # change key if your column has a different name
+# ================================================
+# Easy dataset
+# ================================================
+easy_name = "xTRam1/safe-guard-prompt-injection"
+easy_ds = load_dataset(easy_name)  # has columns ["text","label"]
+
+def preprocess_easy(batch):
+    enc = tokenizer(
+        batch["text"],
         truncation=True,
         padding="max_length",
-        max_length=128
+        max_length=128,
     )
+    return enc
 
-tokenized = dataset.map(preprocess, batched=True)
-tokenized = tokenized.rename_column("label", "labels")  # Hugging Face Trainer expects "labels"
-tokenized.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
+easy_tok = easy_ds.map(preprocess_easy, batched=True)
+easy_tok = easy_tok.rename_column("label", "labels")
+easy_tok.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
-train_data = tokenized["train"]
-test_data = tokenized["test"]
+# ================================================
+# Hard dataset
+# ================================================
+hard_name = "reshabhs/SPML_Chatbot_Prompt_Injection"
+hard_ds = load_dataset(hard_name)  # columns: ["System Prompt","User Prompt","Prompt injection","Degree","Source"]
 
-# -----------------------------------------------
-# 4️⃣ Define metrics
-# -----------------------------------------------
+# make a train/test if none provided
+if "test" not in hard_ds:
+    hard_ds = hard_ds["train"].train_test_split(test_size=0.2, seed=SEED)
+
+def preprocess_hard(batch):
+    # join system+user into one text (handle None)
+    sys = batch.get("System Prompt", [])
+    usr = batch.get("User Prompt", [])
+    text = [f"{(s or '')} {(u or '')}".strip() for s, u in zip(sys, usr)]
+    enc = tokenizer(text, truncation=True, padding="max_length", max_length=128)
+    return enc
+
+hard_tok = hard_ds.map(preprocess_hard, batched=True)
+# labels column is "Prompt injection" (0/1); rename to "labels"
+hard_tok = hard_tok.rename_column("Prompt injection", "labels")
+# ensure labels are ints
+for split in hard_tok:
+    hard_tok[split] = hard_tok[split].cast_column("labels", hard_tok[split].features["labels"])
+hard_tok.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+# ================================================
+# Merge easy + hard for training
+# ================================================
+combined_train = concatenate_datasets([easy_tok["train"], hard_tok["train"]])
+# for evaluation during training we’ll use a combined dev set
+combined_eval  = concatenate_datasets([easy_tok["test"],  hard_tok["test"]])
+
+# ================================================
+# Metrics
+# ================================================
 def compute_metrics(eval_pred):
     preds = np.argmax(eval_pred.predictions, axis=1)
     labels = eval_pred.label_ids
     return {
         "accuracy": accuracy_score(labels, preds),
-        "f1": f1_score(labels, preds, average="weighted")
+        "f1": f1_score(labels, preds, average="weighted"),
     }
 
-# -----------------------------------------------
-# 5️⃣ Fine-tune on the easy dataset
-# -----------------------------------------------
+# ================================================
+# Train
+# ================================================
 training_args = TrainingArguments(
-    output_dir="./results-easy",
-    eval_strategy="epoch",     # ✅ use this instead of evaluation_strategy
+    output_dir="./results-combined",
+    eval_strategy="epoch",          # NOTE: 4.57 uses eval_strategy (NOT evaluation_strategy)
     save_strategy="epoch",
-    per_device_train_batch_size=4,   # better for Apple Silicon memory
-    per_device_eval_batch_size=4,
-    num_train_epochs=1,              # shorter test run
+    num_train_epochs=3,
+    learning_rate=2e-5,
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,
     weight_decay=0.01,
+    warmup_ratio=0.1,
     logging_dir="./logs",
-    logging_steps=50
+    logging_steps=100,
+    seed=SEED,
 )
-
 
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=train_data,
-    eval_dataset=test_data,
+    train_dataset=combined_train,
+    eval_dataset=combined_eval,
     tokenizer=tokenizer,
-    compute_metrics=compute_metrics
+    compute_metrics=compute_metrics,
 )
 
 trainer.train()
-easy_eval = trainer.evaluate()
-print("\n Easy Dataset Results:", easy_eval)
 
-# -----------------------------------------------
-# 6️⃣ Evaluate the trained model on the harder dataset
-# -----------------------------------------------
-hard_dataset_name = "reshabhs/SPML_Chatbot_Prompt_Injection"
-hard_dataset = load_dataset(hard_dataset_name)
-
-# Split manually if there's no "test" split
-if "test" not in hard_dataset:
-    hard_dataset = hard_dataset["train"].train_test_split(test_size=0.2, seed=42)
-
-
-def preprocess_hard(example):
-    # Join system and user prompts into a single string
-    text = [
-        (sp or "") + " " + (up or "")
-        for sp, up in zip(example["System Prompt"], example["User Prompt"])
-    ]
-    return tokenizer(
-        text,
-        truncation=True,
-        padding="max_length",
-        max_length=128
-    )
-
-
-
-hard_tokenized = hard_dataset.map(preprocess_hard, batched=True)
-hard_tokenized = hard_tokenized.rename_column("Prompt injection", "labels")
-hard_tokenized.set_format("torch", columns=["input_ids", "attention_mask", "labels"])
-
-hard_eval = trainer.evaluate(eval_dataset=hard_tokenized["test"])
-print("\n Hard Dataset Results:", hard_eval)
 # ================================================
-# 📊 Visualization: Confusion Matrix + Errors
+# Evaluate separately on easy/hard test sets
 # ================================================
+easy_eval = trainer.evaluate(eval_dataset=easy_tok["test"])
+hard_eval = trainer.evaluate(eval_dataset=hard_tok["test"])
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
-import torch
+print("\n=== Easy Test ===")
+print(easy_eval)
+print("\n=== Hard Test ===")
+print(hard_eval)
 
-# -----------------------------------------------
-# 1️⃣ Get predictions on the hard dataset
-# -----------------------------------------------
-predictions = trainer.predict(hard_tokenized["test"])
-preds = np.argmax(predictions.predictions, axis=1)
-labels = predictions.label_ids
+# ================================================
+# Confusion matrix + misclassified (hard set)
+# ================================================
+preds_out = trainer.predict(hard_tok["test"])
+preds = np.argmax(preds_out.predictions, axis=1)
+labels = preds_out.label_ids
 
-# -----------------------------------------------
-# 2️⃣ Confusion matrix
-# -----------------------------------------------
 cm = confusion_matrix(labels, preds)
 disp = ConfusionMatrixDisplay(confusion_matrix=cm)
 disp.plot(cmap="Blues", colorbar=False)
-plt.title("Confusion Matrix -> Hard Dataset")
+plt.title("Confusion Matrix — Hard Dataset")
+plt.tight_layout()
 plt.savefig("confusion_matrix_hard_dataset.png")
 plt.close()
 
-# -----------------------------------------------
-# 3️⃣ Classification report (precision/recall/F1)
-# -----------------------------------------------
-print("Detailed Classification Report:")
+print("\nDetailed Classification Report (Hard):")
 print(classification_report(labels, preds, digits=4))
 
 # -----------------------------------------------
-# 4️⃣ Show misclassified examples
+# Safely show misclassified examples
 # -----------------------------------------------
-texts = hard_dataset["test"]["text"]
-wrong_idx = np.where(preds != labels)[0]
+raw_hard_test = hard_ds["test"]  # original (non-tokenized) split
+cols = raw_hard_test.column_names
 
-print(f"\n Showing {min(5, len(wrong_idx))} misclassified examples:\n")
+# get columns ONLY if they exist
+user_prompts = raw_hard_test["User Prompt"] if "User Prompt" in cols else None
+sys_prompts  = raw_hard_test["System Prompt"] if "System Prompt" in cols else None
+
+def row_text(i):
+    # Case 1: if User Prompt exists and is non-empty
+    if user_prompts is not None and user_prompts[i] not in [None, ""]:
+        return user_prompts[i]
+
+    # Case 2: fallback → concatenate System + User prompt
+    s = sys_prompts[i] if sys_prompts is not None else ""
+    u = user_prompts[i] if user_prompts is not None else ""
+    combined = (s + " " + u).strip()
+
+    return combined if combined else "<no text available>"
+
+wrong_idx = np.where(preds != labels)[0]
+print(f"\nShowing {min(5, len(wrong_idx))} misclassified examples:\n")
 for i in wrong_idx[:5]:
-    print(f"Text: {texts[i][:200]}...")  # truncate long text
+    txt = row_text(i)
+    print(f"Text: {txt[:200]}...")
     print(f"True Label: {labels[i]} | Predicted: {preds[i]}\n")
 
 # ================================================
-# 🧾 Final Summary Report
+# Final Summary
 # ================================================
-from datetime import datetime
+def p(v): return f"{v:.4f}"
 
-def print_summary(easy_eval, hard_eval):
-    print("========================================")
-    print(" PROMPT INJECTION CLASSIFICATION REPORT")
-    print("========================================")
-    print(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-    print("📘 Model Used:")
-    print("  protectai/deberta-v3-base-prompt-injection\n")
-
-    print("Datasets Evaluated:")
-    print("1  xTRam1/safe-guard-prompt-injection (easy)")
-    print("2 reshabhs/SPML_Chatbot_Prompt_Injection (hard)\n")
-
-    print(" Easy Dataset Results:")
-    print(f"  Accuracy: {easy_eval['eval_accuracy']:.4f}")
-    print(f"  F1 Score: {easy_eval['eval_f1']:.4f}\n")
-
-    print(" Hard Dataset Results:")
-    print(f"  Accuracy: {hard_eval['eval_accuracy']:.4f}")
-    print(f"  F1 Score: {hard_eval['eval_f1']:.4f}\n")
-
-    diff_acc = easy_eval['eval_accuracy'] - hard_eval['eval_accuracy']
-    print(f" Performance Drop (Hard vs Easy): {diff_acc:.4f}")
-    print("\n Interpretation:")
-    if diff_acc > 0.05:
-        print("  → The model struggles more with complex or adversarial prompt injections.")
-    else:
-        print("  → The model generalizes well across both datasets.")
-    print("========================================")
-
-print_summary(easy_eval, hard_eval)
+print("\n========================================")
+print(" PROMPT INJECTION CLASSIFICATION REPORT")
+print("========================================")
+print(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+print("📘 Model Used:")
+print(f"  {MODEL_NAME}\n")
+print("Datasets:")
+print(f"  1) {easy_name} (easy)")
+print(f"  2) {hard_name} (hard)\n")
+print("Results:")
+print(f"  Easy  -> acc={p(easy_eval['eval_accuracy'])}  f1={p(easy_eval['eval_f1'])}")
+print(f"  Hard  -> acc={p(hard_eval['eval_accuracy'])}  f1={p(hard_eval['eval_f1'])}")
+drop = easy_eval["eval_accuracy"] - hard_eval["eval_accuracy"]
+print(f"\nPerformance drop (hard vs easy): {p(drop)}")
+print("Interpretation:")
+print("  → If drop > 0.05, the model struggles more with adversarial/complex injections.")
+print("========================================")
